@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
@@ -75,7 +76,181 @@ def connect_to_mongodb(retry_count=0):
         traceback.print_exc()
         return None, None
 
-def fetch_historical_sales(parent_code):
+def build_forecast_dataframe(result):
+    data = [{"ds": item["_id"], "y": item["total_quantity"]} for item in result]
+    df = pd.DataFrame(data)
+    df['ds'] = pd.to_datetime(df['ds'])
+    return df
+
+def get_month_bounds(year, month):
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+    return start, end
+
+def fetch_pos_order_sales(parent_code, history_end_date=None):
+    date_match = {"paid_at_parsed": {"$ne": None}}
+    if history_end_date is not None:
+        date_match["paid_at_parsed"]["$lt"] = history_end_date
+
+    pipeline = [
+        {
+            "$match": {"status": "paid"}
+        },
+        {
+            "$unwind": "$items"
+        },
+        {
+            "$lookup": {
+                "from": "masterproducts",
+                "localField": "items.masterProductId",
+                "foreignField": "_id",
+                "as": "master_product"
+            }
+        },
+        {
+            "$unwind": "$master_product"
+        },
+        {
+            "$match": {"master_product.parentCode": parent_code}
+        },
+        {
+            "$addFields": {
+                "paid_at_parsed": {
+                    "$convert": {
+                        "input": "$paidAt",
+                        "to": "date",
+                        "onError": None,
+                        "onNull": None
+                    }
+                }
+            }
+        },
+        {
+            "$match": date_match
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {
+                        "format": "%Y-%m-%d",
+                        "date": "$paid_at_parsed"
+                    }
+                },
+                "total_quantity": {"$sum": {"$ifNull": ["$items.qty", 1]}}
+            }
+        },
+        {
+            "$sort": {"_id": 1}
+        }
+    ]
+
+    return list(db.posorders.aggregate(pipeline))
+
+def fetch_legacy_sale_item_sales(parent_code, history_end_date=None):
+    date_match = {"sold_at_parsed": {"$ne": None}}
+    if history_end_date is not None:
+        date_match["sold_at_parsed"]["$lt"] = history_end_date
+
+    pipeline = [
+        {
+            "$match": {"parentCodeSnapshot": parent_code}
+        },
+        {
+            "$lookup": {
+                "from": "saletransactions",
+                "localField": "saleTransactionId",
+                "foreignField": "_id",
+                "as": "transaction"
+            }
+        },
+        {
+            "$unwind": "$transaction"
+        },
+        {
+            "$addFields": {
+                "sold_at_parsed": {
+                    "$convert": {
+                        "input": "$transaction.soldAt",
+                        "to": "date",
+                        "onError": None,
+                        "onNull": None
+                    }
+                }
+            }
+        },
+        {
+            "$match": date_match
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$dateToString": {
+                        "format": "%Y-%m-%d",
+                        "date": "$sold_at_parsed"
+                    }
+                },
+                "total_quantity": {"$sum": {"$ifNull": ["$quantity", 1]}}
+            }
+        },
+        {
+            "$sort": {"_id": 1}
+        }
+    ]
+
+    return list(db.saleitems.aggregate(pipeline))
+
+def fetch_parent_codes(history_end_date=None):
+    date_match = {"paid_at_parsed": {"$ne": None}}
+    if history_end_date is not None:
+        date_match["paid_at_parsed"]["$lt"] = history_end_date
+
+    pipeline = [
+        {
+            "$match": {"status": "paid"}
+        },
+        {
+            "$unwind": "$items"
+        },
+        {
+            "$lookup": {
+                "from": "masterproducts",
+                "localField": "items.masterProductId",
+                "foreignField": "_id",
+                "as": "master_product"
+            }
+        },
+        {
+            "$unwind": "$master_product"
+        },
+        {
+            "$addFields": {
+                "paid_at_parsed": {
+                    "$convert": {
+                        "input": "$paidAt",
+                        "to": "date",
+                        "onError": None,
+                        "onNull": None
+                    }
+                }
+            }
+        },
+        {
+            "$match": date_match
+        },
+        {
+            "$group": {"_id": "$master_product.parentCode"}
+        },
+        {
+            "$sort": {"_id": 1}
+        }
+    ]
+
+    return [item["_id"] for item in db.posorders.aggregate(pipeline) if item.get("_id")]
+
+def fetch_historical_sales(parent_code, history_end_date=None):
     """
     Fetch historical sales data for a specific parent_code from MongoDB.
     Groups sales by date and sums the total quantity for that product.
@@ -91,58 +266,44 @@ def fetch_historical_sales(parent_code):
         return pd.DataFrame()
     
     try:
-        print(f"📊 Fetching historical sales for product: {parent_code}")
-        
-        pipeline = [
-            {
-                "$match": {"parentCodeSnapshot": parent_code}
-            },
-            {
-                "$lookup": {
-                    "from": "saletransactions",
-                    "localField": "saleTransactionId",
-                    "foreignField": "_id",
-                    "as": "transaction"
-                }
-            },
-            {
-                "$unwind": "$transaction"
-            },
-            {
-                "$group": {
-                    "_id": {
-                        "$dateToString": {
-                            "format": "%Y-%m-%d",
-                            "date": "$transaction.soldAt"
-                        }
-                    },
-                    "total_quantity": {"$sum": "$quantity"}
-                }
-            },
-            {
-                "$sort": {"_id": 1}
-            }
-        ]
+        print(f"📊 Fetching POS historical sales for product: {parent_code}")
 
-        result = list(db.saleitems.aggregate(pipeline))
+        result = fetch_pos_order_sales(parent_code, history_end_date)
+
+        if result and len(result) > 0:
+            print(f"✓ Found {len(result)} POS historical data points")
+            return build_forecast_dataframe(result)
+
+        print(f"⚠ No POS historical data found for {parent_code}; checking legacy saleitems")
+        result = fetch_legacy_sale_item_sales(parent_code, history_end_date)
         
         if not result or len(result) == 0:
             print(f"⚠ No historical data found for {parent_code}")
             return pd.DataFrame()
         
-        print(f"✓ Found {len(result)} historical data points")
-
-        # Convert to DataFrame
-        data = [{"ds": item["_id"], "y": item["total_quantity"]} for item in result]
-        df = pd.DataFrame(data)
-        df['ds'] = pd.to_datetime(df['ds'])
-        
-        return df
+        print(f"✓ Found {len(result)} legacy historical data points")
+        return build_forecast_dataframe(result)
         
     except Exception as e:
         print(f"❌ Error fetching historical sales: {e}")
         traceback.print_exc()
         return pd.DataFrame()
+
+def build_constant_forecast(parent_code, df, forecast_dates):
+    quantity = max(0, int(round(df['y'].mean())))
+    last_updated = datetime.now().isoformat()
+
+    return [
+        {
+            "product_code": parent_code,
+            "forecast_date": forecast_date.to_pydatetime(),
+            "predicted_quantity": quantity,
+            "lower_bound_estimate": quantity,
+            "upper_bound_estimate": quantity,
+            "last_updated": last_updated
+        }
+        for forecast_date in forecast_dates
+    ]
 
 def validate_forecast_data(df, parent_code):
     """
@@ -180,7 +341,7 @@ def validate_forecast_data(df, parent_code):
     
     return True, None
 
-def forecast_quantity(parent_code):
+def forecast_quantity(parent_code, target_start=None, target_end=None):
     """
     Run Facebook Prophet to forecast quantity for the next 30 days.
     
@@ -194,7 +355,22 @@ def forecast_quantity(parent_code):
         print(f"\n🔮 Starting forecast for: {parent_code}")
         
         # Fetch data
-        df = fetch_historical_sales(parent_code)
+        target_mode = target_start is not None and target_end is not None
+        df = fetch_historical_sales(parent_code, target_start if target_mode else None)
+
+        if target_mode and df is not None and not df.empty and len(df) < MIN_DATA_POINTS:
+            forecast_dates = pd.date_range(
+                start=target_start,
+                end=target_end - timedelta(days=1),
+                freq='D'
+            )
+            print(
+                f"⚠ Only {len(df)} historical point found for {parent_code}; "
+                "using flat average forecast for target month"
+            )
+            results = build_constant_forecast(parent_code, df, forecast_dates)
+            print(f"✓ Generated {len(results)} flat forecast records")
+            return results
         
         # Validate data
         is_valid, error_msg = validate_forecast_data(df, parent_code)
@@ -234,8 +410,22 @@ def forecast_quantity(parent_code):
         
         # Generate forecast
         try:
-            print(f"🔮 Generating {FORECAST_PERIOD}-day forecast...")
-            future = model.make_future_dataframe(periods=FORECAST_PERIOD)
+            if target_mode:
+                days = (target_end - target_start).days
+                print(
+                    f"🔮 Generating target forecast for "
+                    f"{target_start.strftime('%B %Y')} ({days} days)..."
+                )
+                future = pd.DataFrame({
+                    'ds': pd.date_range(
+                        start=target_start,
+                        end=target_end - timedelta(days=1),
+                        freq='D'
+                    )
+                })
+            else:
+                print(f"🔮 Generating {FORECAST_PERIOD}-day forecast...")
+                future = model.make_future_dataframe(periods=FORECAST_PERIOD)
             forecast = model.predict(future)
             print("✓ Forecast generated successfully")
         except Exception as e:
@@ -244,8 +434,9 @@ def forecast_quantity(parent_code):
             return []
         
         # Format results
-        forecasted = forecast.tail(FORECAST_PERIOD)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-        forecasted['ds'] = forecasted['ds'].dt.strftime('%Y-%m-%d')
+        forecasted = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+        if not target_mode:
+            forecasted = forecasted.tail(FORECAST_PERIOD)
         
         # Validate forecast values
         last_updated = datetime.now().isoformat()
@@ -254,7 +445,7 @@ def forecast_quantity(parent_code):
         for _, row in forecasted.iterrows():
             # Check for NaN values
             if pd.isna(row['yhat']) or pd.isna(row['yhat_lower']) or pd.isna(row['yhat_upper']):
-                print(f"⚠ Warning: NaN forecast value for {row['ds']}")
+                print(f"⚠ Warning: NaN forecast value for {row['ds'].date()}")
                 continue
             
             # Stock quantities should be whole units, not decimal estimates.
@@ -264,7 +455,7 @@ def forecast_quantity(parent_code):
             
             results.append({
                 "product_code": parent_code,
-                "forecast_date": row['ds'],
+                "forecast_date": row['ds'].to_pydatetime(),
                 "predicted_quantity": yhat,
                 "lower_bound_estimate": yhat_lower,
                 "upper_bound_estimate": yhat_upper,
@@ -279,7 +470,29 @@ def forecast_quantity(parent_code):
         traceback.print_exc()
         return []
 
-def save_forecast_to_db(parent_code, forecast_data):
+def clear_forecast_period(start_date, end_date):
+    if db is None:
+        print(f"❌ Database not connected")
+        return False
+
+    try:
+        delete_result = db.forecastresults.delete_many({
+            "forecast_date": {
+                "$gte": start_date,
+                "$lt": end_date
+            }
+        })
+        print(
+            f"✓ Cleared {delete_result.deleted_count} existing forecast records "
+            f"for {start_date.strftime('%B %Y')}"
+        )
+        return True
+    except Exception as e:
+        print(f"❌ Error clearing forecast period: {e}")
+        traceback.print_exc()
+        return False
+
+def save_forecast_to_db(parent_code, forecast_data, replace_existing=True):
     """
     Save forecast results to MongoDB, overwriting existing data for the product.
     
@@ -301,9 +514,10 @@ def save_forecast_to_db(parent_code, forecast_data):
     try:
         collection = db.forecastresults
         
-        # Delete existing forecasts for this product
-        delete_result = collection.delete_many({"product_code": parent_code})
-        print(f"✓ Deleted {delete_result.deleted_count} existing forecast records")
+        if replace_existing:
+            # Delete existing forecasts for this product
+            delete_result = collection.delete_many({"product_code": parent_code})
+            print(f"✓ Deleted {delete_result.deleted_count} existing forecast records")
         
         # Insert new forecasts
         insert_result = collection.insert_many(forecast_data)
@@ -316,17 +530,46 @@ def save_forecast_to_db(parent_code, forecast_data):
         traceback.print_exc()
         return False
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate KriyaLogic product demand forecasts."
+    )
+    parser.add_argument(
+        "parent_codes",
+        nargs="*",
+        help="Product codes to forecast. Omit when using --month and --year to forecast all POS products."
+    )
+    parser.add_argument(
+        "--month",
+        type=int,
+        choices=range(1, 13),
+        metavar="1-12",
+        help="Target forecast month."
+    )
+    parser.add_argument(
+        "--year",
+        type=int,
+        help="Target forecast year."
+    )
+
+    args = parser.parse_args()
+
+    if (args.month is None) != (args.year is None):
+        parser.error("--month and --year must be provided together")
+
+    if args.month is None and len(args.parent_codes) == 0:
+        parser.error("provide parent codes or use --month and --year")
+
+    if args.year is not None and args.year < 1900:
+        parser.error("--year must be a valid year")
+
+    return args
+
 def main():
     """
     Main entry point for forecasting engine.
     """
-    # Check arguments
-    if len(sys.argv) < 2:
-        print("Usage: python ml_forecasting.py <parent_code> [parent_code2 ...]")
-        print("Example: python ml_forecasting.py PB001 PG001 PN001")
-        sys.exit(1)
-    
-    parent_codes = sys.argv[1:]
+    args = parse_args()
     
     print("=" * 60)
     print("🚀 KriyaLogic ML Forecasting Engine")
@@ -341,6 +584,32 @@ def main():
         sys.exit(1)
     
     try:
+        target_start = None
+        target_end = None
+        replace_existing = True
+
+        if args.month is not None and args.year is not None:
+            target_start, target_end = get_month_bounds(args.year, args.month)
+            print(
+                f"🎯 Target forecast month: "
+                f"{target_start.strftime('%B %Y')}"
+            )
+            print(
+                f"📚 Historical cutoff: before "
+                f"{target_start.strftime('%Y-%m-%d')}"
+            )
+
+            parent_codes = args.parent_codes or fetch_parent_codes(target_start)
+            if not parent_codes:
+                print("❌ No POS products found for the target historical period")
+                sys.exit(1)
+
+            if not clear_forecast_period(target_start, target_end):
+                sys.exit(1)
+            replace_existing = False
+        else:
+            parent_codes = args.parent_codes
+
         # Process each product
         successful = 0
         failed = 0
@@ -349,11 +618,11 @@ def main():
             print(f"\n{'='*60}")
             
             # Run forecast
-            forecast_data = forecast_quantity(parent_code)
+            forecast_data = forecast_quantity(parent_code, target_start, target_end)
             
             # Save to database
             if forecast_data:
-                if save_forecast_to_db(parent_code, forecast_data):
+                if save_forecast_to_db(parent_code, forecast_data, replace_existing):
                     print(f"✓ Successfully completed forecast for: {parent_code}")
                     successful += 1
                 else:
