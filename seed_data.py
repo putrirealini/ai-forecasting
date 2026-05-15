@@ -2,13 +2,13 @@ import os
 import sys
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutException
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import pandas as pd
 from datetime import datetime
 import traceback
 
 # Load environment variables
-load_dotenv(dotenv_path='./.env')
+load_dotenv(dotenv_path='../kriyalogic-backend/.env')
 
 # Configuration
 MONGO_URI = os.getenv('MONGO_URI')
@@ -53,7 +53,7 @@ def connect_to_mongodb(retry_count=0):
         print("✓ MongoDB connected successfully")
         return client, db
         
-    except (ConnectionFailure, ServerSelectionTimeoutException) as e:
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
         print(f"⚠ Connection failed: {str(e)}")
         
         if retry_count < RETRY_ATTEMPTS - 1:
@@ -101,7 +101,7 @@ def seed_data_from_excel():
     """
     try:
         # Hardcoded file path - adjust as needed
-        excel_file = '../data new sep-jan.xlsx'
+        excel_file = '../data/data new sep-jan.xlsx'
         
         print(f"📊 Seed Data Pipeline Started")
         print("=" * 60)
@@ -123,7 +123,7 @@ def seed_data_from_excel():
             return False
 
         # Validate required columns
-        required_cols = ['Tanggal', 'Nama Patung', 'Total (Rp)', 'Nama Artisan']
+        required_cols = ['Tanggal', 'Nama Patung', 'Total (Rp)', 'Nama Artisan', 'Jumlah']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             print(f"❌ Missing required columns: {missing_cols}")
@@ -137,6 +137,7 @@ def seed_data_from_excel():
             print(f"📊 Grouping data by date and product...")
             df_grouped = df.groupby(['Tanggal', 'Nama Patung']).agg({
                 'Total (Rp)': 'sum',
+                'Jumlah': 'sum',
                 'Nama Artisan': 'first',
                 'Tour Guide': lambda x: x.dropna().iloc[0] if not x.dropna().empty else None,
                 'Metode Pembayaran': 'first'
@@ -148,7 +149,7 @@ def seed_data_from_excel():
             return False
 
         # Check if database is connected
-        if not db:
+        if db is None:
             print(f"❌ Database not connected")
             return False
 
@@ -198,6 +199,7 @@ def seed_data_from_excel():
                     'artisanNameSnapshot': row['Nama Artisan'],
                     'costPriceSnapshot': float(row['Total (Rp)']) * 0.7 if pd.notna(row['Total (Rp)']) else 0,
                     'sellingPriceSnapshot': float(row['Total (Rp)']) if pd.notna(row['Total (Rp)']) else 0,
+                    'quantity': int(row['Jumlah']) if pd.notna(row['Jumlah']) else 1,
                     'artisanCommissionRateSnapshot': 10,
                     'artisanCommissionAmount': float(row['Total (Rp)']) * 0.1 if pd.notna(row['Total (Rp)']) else 0
                 }
@@ -240,7 +242,7 @@ def main():
     global client, db
     client, db = connect_to_mongodb()
     
-    if not client or not db:
+    if client is None or db is None:
         print("\n❌ Cannot proceed without database connection")
         sys.exit(1)
     

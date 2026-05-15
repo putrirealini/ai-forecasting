@@ -2,7 +2,6 @@ import os
 import sys
 from dotenv import load_dotenv
 from pymongo import MongoClient
-# from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutException
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import pandas as pd
 from prophet import Prophet
@@ -20,7 +19,7 @@ if not MONGO_URI:
     sys.exit(1)
 
 # Constants for data validation
-MIN_DATA_POINTS = 20  # Minimum data points Prophet needs
+MIN_DATA_POINTS = 2  # Minimum data points Prophet needs
 FORECAST_PERIOD = 30  # Days to forecast
 CONNECTION_TIMEOUT_MS = 5000
 RETRY_ATTEMPTS = 3
@@ -79,15 +78,15 @@ def connect_to_mongodb(retry_count=0):
 def fetch_historical_sales(parent_code):
     """
     Fetch historical sales data for a specific parent_code from MongoDB.
-    Groups sales by date and sums the total sales for that product.
+    Groups sales by date and sums the total quantity for that product.
     
     Args:
         parent_code: Product code to fetch data for
         
     Returns:
-        pd.DataFrame: DataFrame with 'ds' (date) and 'y' (sales) columns, or empty DataFrame
+        pd.DataFrame: DataFrame with 'ds' (date) and 'y' (quantity) columns, or empty DataFrame
     """
-    if client is None or db is None:
+    if db is None:
         print(f"❌ Database not connected")
         return pd.DataFrame()
     
@@ -117,7 +116,7 @@ def fetch_historical_sales(parent_code):
                             "date": "$transaction.soldAt"
                         }
                     },
-                    "total_sales": {"$sum": "$sellingPriceSnapshot"}
+                    "total_quantity": {"$sum": "$quantity"}
                 }
             },
             {
@@ -134,7 +133,7 @@ def fetch_historical_sales(parent_code):
         print(f"✓ Found {len(result)} historical data points")
 
         # Convert to DataFrame
-        data = [{"ds": item["_id"], "y": item["total_sales"]} for item in result]
+        data = [{"ds": item["_id"], "y": item["total_quantity"]} for item in result]
         df = pd.DataFrame(data)
         df['ds'] = pd.to_datetime(df['ds'])
         
@@ -181,9 +180,9 @@ def validate_forecast_data(df, parent_code):
     
     return True, None
 
-def forecast_demand(parent_code):
+def forecast_quantity(parent_code):
     """
-    Run Facebook Prophet to forecast demand for the next 30 days.
+    Run Facebook Prophet to forecast quantity for the next 30 days.
     
     Args:
         parent_code: Product code to forecast
@@ -258,15 +257,15 @@ def forecast_demand(parent_code):
                 print(f"⚠ Warning: NaN forecast value for {row['ds']}")
                 continue
             
-            # Ensure positive values (optional - adjust based on business logic)
-            yhat = max(0, round(row['yhat'], 2))
-            yhat_lower = max(0, round(row['yhat_lower'], 2))
-            yhat_upper = max(0, round(row['yhat_upper'], 2))
+            # Stock quantities should be whole units, not decimal estimates.
+            yhat = max(0, int(round(row['yhat'])))
+            yhat_lower = max(0, int(round(row['yhat_lower'])))
+            yhat_upper = max(0, int(round(row['yhat_upper'])))
             
             results.append({
                 "product_code": parent_code,
                 "forecast_date": row['ds'],
-                "predicted_demand": yhat,
+                "predicted_quantity": yhat,
                 "lower_bound_estimate": yhat_lower,
                 "upper_bound_estimate": yhat_upper,
                 "last_updated": last_updated
@@ -276,7 +275,7 @@ def forecast_demand(parent_code):
         return results
         
     except Exception as e:
-        print(f"❌ Unexpected error in forecast_demand: {e}")
+        print(f"❌ Unexpected error in forecast_quantity: {e}")
         traceback.print_exc()
         return []
 
@@ -291,7 +290,7 @@ def save_forecast_to_db(parent_code, forecast_data):
     Returns:
         bool: True if successful, False otherwise
     """
-    if not db:
+    if db is None:
         print(f"❌ Database not connected")
         return False
     
@@ -350,7 +349,7 @@ def main():
             print(f"\n{'='*60}")
             
             # Run forecast
-            forecast_data = forecast_demand(parent_code)
+            forecast_data = forecast_quantity(parent_code)
             
             # Save to database
             if forecast_data:

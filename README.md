@@ -104,7 +104,7 @@ RETRY_ATTEMPTS = 3
   "_id": "ObjectId",
   "product_code": "PB001",
   "forecast_date": "2025-09-01",
-  "predicted_demand": 7423.45,
+  "predicted_quantity": 7423.45,
   "lower_bound_estimate": 6309.43,
   "upper_bound_estimate": 8537.47,
   "last_updated": "2026-05-02T10:30:45.123456"
